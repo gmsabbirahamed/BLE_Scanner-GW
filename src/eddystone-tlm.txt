@@ -1,0 +1,69 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+// Helper macro to swap endianness if needed
+#define ENDIAN_CHANGE_U16(x) ((((x)&0xFF00) >> 8) + (((x)&0xFF) << 8))
+
+NimBLEScan* pBLEScan;
+
+// Custom callback for each advertisement
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    
+    // 🔴 REMOVE name check → many Eddystone-TLM beacons don’t broadcast name
+    // if (!advertisedDevice->haveName()) return; 
+
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+    if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->getServiceUUID().equals(eddyUUID)) {
+      return; // Not an Eddystone beacon
+    }
+
+    // Extract service data (contains Eddystone frame)
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // 0x20 = TLM
+
+    // Parse with NimBLEEddystoneTLM
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    Serial.println("\n📡 Found Eddystone-TLM Beacon");
+    if (advertisedDevice->haveName()) {
+      Serial.printf("   ▸ Name            : %s \n", advertisedDevice->getName().c_str());
+    }
+    Serial.printf("   ▸ Battery Voltage : %d mV\n", tlm.getVolt());
+
+    // Temperature: library sometimes returns 0x8000 (invalid), so we calculate manually
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+    Serial.printf("   ▸ Temp            : %.2f °C\n", calcTemp);
+
+    Serial.printf("   ▸ Adv Count       : %u\n", tlm.getCount());
+    Serial.printf("   ▸ Uptime          : %u sec (%.2f h)\n", tlm.getTime(), tlm.getTime() / 3600.0);
+    Serial.printf("   ▸ RSSI            : %d dBm\n", advertisedDevice->getRSSI());
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n🚀 BLE Beacon Scanner Started");
+
+  NimBLEDevice::init("ESP32-Scanner");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true); // true = allow duplicates
+  pBLEScan->setActiveScan(true);  // collect full data
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  // ✅ Start continuous scan
+  pBLEScan->start(0, false, false);
+}
+
+
+void loop() {
+  // Nothing here → scanning runs in background continuously
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+}

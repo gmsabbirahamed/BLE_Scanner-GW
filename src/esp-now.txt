@@ -1,0 +1,37 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+typedef struct __attribute__((packed)) {
+  char name[32];
+  float tempC;
+  uint16_t battery;
+  int8_t rssi;
+  uint32_t advCount;
+  uint32_t uptimeDays;
+} BeaconDataPacket;
+
+void onReceiveData(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  BeaconDataPacket data;
+  memcpy(&data, incomingData, sizeof(data));
+
+  Serial.println("📩 Data received:");
+  Serial.printf("   ▸ Name     : %s\n", data.name);
+  Serial.printf("   ▸ Temp     : %.2f °C\n", data.tempC);
+  Serial.printf("   ▸ Battery  : %dmV\n", data.battery);
+  Serial.printf("   ▸ RSSI     : %d dBm\n", data.rssi);
+  Serial.printf("   ▸ Count    : %u\n", data.advCount);
+  Serial.printf("   ▸ Uptime   : %u days\n", data.uptimeDays);
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_recv_cb(onReceiveData);
+  Serial.println("✅ ESP-NOW Receiver Ready");
+}
+
+void loop() {}

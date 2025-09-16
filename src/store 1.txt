@@ -1,0 +1,132 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+// ====== Linked List Structures ======
+struct SensorData {
+  float temperature;
+  uint16_t voltage;
+  uint32_t uptime;
+  uint32_t advCount;
+  int rssi;
+  unsigned long timestamp; // millis() when stored
+  SensorData* next;
+};
+
+struct SensorNode {
+  String mac;
+  SensorData* dataHead;
+  SensorNode* next;
+};
+
+SensorNode* sensorList = nullptr;  // Linked list of sensors
+NimBLEScan* pBLEScan;
+
+unsigned long lastPrintTime = 0;
+const unsigned long STORE_INTERVAL = 60000; // 1 minute
+
+// ====== Utility Functions ======
+SensorNode* findOrCreateSensor(const String& mac) {
+  SensorNode* node = sensorList;
+  while (node) {
+    if (node->mac == mac) return node;
+    node = node->next;
+  }
+  // Not found -> create new node (use new, not malloc!)
+  SensorNode* newNode = new SensorNode();
+  newNode->mac = mac;
+  newNode->dataHead = nullptr;
+  newNode->next = sensorList;
+  sensorList = newNode;
+  return newNode;
+}
+
+void addSensorData(SensorNode* sensor, float temp, uint16_t volt,
+                   uint32_t uptime, uint32_t advCount, int rssi) {
+  // Use new instead of malloc
+  SensorData* newData = new SensorData();
+  newData->temperature = temp;
+  newData->voltage = volt;
+  newData->uptime = uptime;
+  newData->advCount = advCount;
+  newData->rssi = rssi;
+  newData->timestamp = millis();
+  newData->next = sensor->dataHead;
+  sensor->dataHead = newData;
+}
+
+void printAndClearData() {
+  Serial.println("\n===== 📊 1 Minute Summary =====");
+  SensorNode* node = sensorList;
+  while (node) {
+    Serial.printf("\n📡 Sensor MAC: %s\n", node->mac.c_str());
+    SensorData* data = node->dataHead;
+    while (data) {
+      Serial.printf("   ▸ Temp: %.2f °C | Volt: %u mV | Uptime: %u s | AdvCount: %u | RSSI: %d dBm\n",
+                    data->temperature, data->voltage, data->uptime, data->advCount, data->rssi);
+      data = data->next;
+    }
+    // Free memory safely
+    data = node->dataHead;
+    while (data) {
+      SensorData* toDelete = data;
+      data = data->next;
+      delete toDelete;  // free with delete
+    }
+    node->dataHead = nullptr;
+    node = node->next;
+  }
+  Serial.println("===== End of Summary =====\n");
+}
+
+
+// ====== Scan Callback ======
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+
+    if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->getServiceUUID().equals(eddyUUID)) return;
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // Not TLM
+
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+
+    // Find or create sensor by MAC
+    String mac = advertisedDevice->getAddress().toString().c_str();
+    SensorNode* sensor = findOrCreateSensor(mac);
+
+    // Store reading
+    addSensorData(sensor, calcTemp, tlm.getVolt(), tlm.getTime(), tlm.getCount(), advertisedDevice->getRSSI());
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+// ====== Setup & Loop ======
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n🚀 BLE Beacon Scanner + Data Logger");
+
+  NimBLEDevice::init("ESP32-Scanner");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  pBLEScan->start(0, false, false); // continuous
+
+  lastPrintTime = millis();
+}
+
+void loop() {
+  if (millis() - lastPrintTime >= STORE_INTERVAL) {
+    printAndClearData();
+    lastPrintTime = millis();
+  }
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+}

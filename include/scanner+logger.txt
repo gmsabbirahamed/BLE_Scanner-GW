@@ -1,0 +1,219 @@
+// Scanner + Data Logger (ESP32)
+// - Scans Eddystone-TLM using NimBLE-Arduino
+// - Stores readings in per-MAC linked lists (dynamic memory using new/delete)
+// - Every minute: sends CSV lines over Serial2, ends with "END\n"
+// - Waits for "ACK\n" to free memory, otherwise keeps data for retry
+// - LED2: blinking normally, SOLID when stored readings exceed threshold
+
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEEddystoneTLM.h"
+
+// ===== Config =====
+#define SERIAL_BAUD      115200
+#define SERIAL2_BAUD     115200
+#define SERIAL2_TX_PIN   17   // adjust as needed
+#define SERIAL2_RX_PIN   16
+
+#define LED2_PIN         2    // built-in LED on many ESP32s (change if different)
+#define STORE_INTERVAL_MS 60000UL  // 1 minute
+#define MEMORY_HEAVY_THRESHOLD 200 // if total stored readings > this -> LED solid
+
+// ===== Data structures =====
+struct SensorData {
+  float temperature;
+  uint16_t voltage;
+  uint32_t uptime;
+  uint32_t advCount;
+  int rssi;
+  unsigned long timestamp; // millis of record
+  SensorData* next;
+};
+
+struct SensorNode {
+  String mac;
+  SensorData* dataHead;
+  SensorNode* next;
+  SensorNode() : mac(""), dataHead(nullptr), next(nullptr) {}
+};
+
+static SensorNode* sensorList = nullptr;
+
+// ===== NimBLE Scan handle =====
+NimBLEScan* pBLEScan;
+
+// ===== Utility functions =====
+SensorNode* findOrCreateSensor(const String& mac) {
+  for (SensorNode* n = sensorList; n; n = n->next) {
+    if (n->mac == mac) return n;
+  }
+  // create node using new so String ctor runs
+  SensorNode* node = new SensorNode();
+  node->mac = mac;
+  node->dataHead = nullptr;
+  node->next = sensorList;
+  sensorList = node;
+  return node;
+}
+
+void addSensorData(SensorNode* sensor, float temp, uint16_t volt,
+                   uint32_t uptime, uint32_t advCount, int rssi) {
+  SensorData* d = new SensorData();
+  d->temperature = temp;
+  d->voltage = volt;
+  d->uptime = uptime;
+  d->advCount = advCount;
+  d->rssi = rssi;
+  d->timestamp = millis();
+  d->next = sensor->dataHead;
+  sensor->dataHead = d;
+}
+
+size_t totalStoredReadings() {
+  size_t cnt = 0;
+  for (SensorNode* n = sensorList; n; n = n->next) {
+    for (SensorData* d = n->dataHead; d; d = d->next) ++cnt;
+  }
+  return cnt;
+}
+
+// Clear data for all sensors (free memory)
+void clearAllData() {
+  for (SensorNode* n = sensorList; n; n = n->next) {
+    SensorData* d = n->dataHead;
+    while (d) {
+      SensorData* td = d;
+      d = d->next;
+      delete td;
+    }
+    n->dataHead = nullptr;
+  }
+}
+
+// ===== Serial2 send logic =====
+// Sends all data lines via Serial2 in CSV format:
+// mac,temp,volt,uptime,advcount,rssi\n
+// After sending lines, send "END\n" then wait for "ACK\n" or "NACK\n"
+bool sendAllDataAndWaitAck(uint32_t timeoutMs = 2000) {
+  // Send lines
+  for (SensorNode* n = sensorList; n; n = n->next) {
+    SensorData* d = n->dataHead;
+    // iterate and send from oldest->newest? we store newest at head. We'll send head->...
+    for (SensorData* cur = d; cur; cur = cur->next) {
+      // Format numbers compactly
+      Serial2.printf("%s,%.2f,%u,%u,%u,%d\n",
+                     n->mac.c_str(),
+                     cur->temperature,
+                     cur->voltage,
+                     cur->uptime,
+                     cur->advCount,
+                     cur->rssi);
+      delay(5); // small spacing to avoid serial overruns (adjust if needed)
+    }
+  }
+  // End marker
+  Serial2.print("END\n");
+
+  // Wait for ACK/NACK
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeoutMs) {
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (c == '\n') {
+        resp.trim();
+        if (resp == "ACK") return true;
+        if (resp == "NACK") return false;
+        resp = ""; // otherwise ignore and continue
+      } else {
+        resp += c;
+      }
+    }
+    delay(5);
+  }
+  // timeout -> treat as NACK (no ack)
+  return false;
+}
+
+// ===== NimBLE callback =====
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+    if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->getServiceUUID().equals(eddyUUID)) return;
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // not TLM
+
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    // manual temp parsing (8.8 fixed)
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+
+    String mac = advertisedDevice->getAddress().toString().c_str();
+    SensorNode* node = findOrCreateSensor(mac);
+    addSensorData(node, calcTemp, tlm.getVolt(), tlm.getTime(), tlm.getCount(), advertisedDevice->getRSSI());
+  }
+};
+static ScanCallbacks scanCallbacks;
+
+// ===== LED behavior =====
+uint32_t ledBlinkInterval = 500;
+unsigned long lastLedToggle = 0;
+bool ledState = false;
+
+void updateLED() {
+  size_t stored = totalStoredReadings();
+  if (stored > MEMORY_HEAVY_THRESHOLD) {
+    // solid ON
+    digitalWrite(LED2_PIN, HIGH);
+  } else {
+    // blinking
+    if (millis() - lastLedToggle >= ledBlinkInterval) {
+      lastLedToggle = millis();
+      ledState = !ledState;
+      digitalWrite(LED2_PIN, ledState ? HIGH : LOW);
+    }
+  }
+}
+
+// ===== Setup & loop =====
+unsigned long lastSendTime = 0;
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
+  pinMode(LED2_PIN, OUTPUT);
+  digitalWrite(LED2_PIN, LOW);
+
+  Serial.println("\n🚀 BLE Scanner + Data Logger (Scanner ESP)");
+  NimBLEDevice::init("ESP32-Scanner");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true); // allow duplicates
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  pBLEScan->start(0, false, false);
+
+  lastSendTime = millis();
+}
+
+void loop() {
+  // LED update (non-blocking)
+  updateLED();
+
+  // Periodic send
+  if (millis() - lastSendTime >= STORE_INTERVAL_MS) {
+    lastSendTime = millis();
+    Serial.println("Sending stored data via Serial2 ...");
+    bool ok = sendAllDataAndWaitAck(3000); // 3s timeout for ACK
+    if (ok) {
+      Serial.println("ACK received -> clearing stored data");
+      clearAllData();
+    } else {
+      Serial.println("No ACK / NACK -> will retry next minute. Data retained.");
+    }
+  }
+
+  vTaskDelay(50 / portTICK_PERIOD_MS);
+}

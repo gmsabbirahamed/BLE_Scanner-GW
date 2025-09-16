@@ -1,0 +1,61 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+NimBLEScan* pBLEScan;
+
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+
+    // Check if Eddystone UUID is present
+    if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->getServiceUUID().equals(eddyUUID)) {
+      return; // not an Eddystone beacon
+    }
+
+    // Extract service data
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // 0x20 = TLM frame
+
+    // Parse TLM
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    // Print information
+    Serial.println("\n📡 Found Eddystone-TLM Beacon");
+    if (advertisedDevice->haveName()) {
+      Serial.printf("   ▸ Name            : %s \n", advertisedDevice->getName().c_str());
+    }
+    Serial.printf("   ▸ MAC Address     : %s\n", advertisedDevice->getAddress().toString().c_str());
+    // Temperature calculation (library sometimes fails, so manual fallback)
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+    Serial.printf("   ▸ Temp            : %.2f °C\n", calcTemp);
+    Serial.printf("   ▸ Battery Voltage : %d mV\n", tlm.getVolt());
+    Serial.printf("   ▸ Uptime          : %u sec (%.2f h)\n", tlm.getTime(), tlm.getTime() / 3600.0);
+    Serial.printf("   ▸ Adv Count       : %u\n", tlm.getCount());
+    Serial.printf("   ▸ RSSI            : %d dBm\n", advertisedDevice->getRSSI());
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n🚀 BLE Beacon Scanner Started");
+
+  NimBLEDevice::init("ESP32-Scanner");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true); // true = report duplicates
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  // Continuous scan (no timeout)
+  pBLEScan->start(0, false, false);
+}
+
+void loop() {
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // nothing to do, scanning runs in background
+}

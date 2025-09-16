@@ -1,0 +1,190 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <vector>  // Include vector header for using std::vector
+
+// ===== Config =====
+#define SERIAL_BAUD     115200
+#define SERIAL2_BAUD    115200
+#define SERIAL2_TX_PIN  14
+#define SERIAL2_RX_PIN  12
+
+#define LED_STATUS_PIN  2
+
+// WiFi / MQTT - set your credentials
+const char* WIFI_SSID = "Settings";
+const char* WIFI_PASS = "procariota156";
+
+const char* MQTT_SERVER = "broker2.dma-bd.com"; // broker IP / hostname
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_USER = "broker2"; // Username for secure MQTT
+const char* MQTT_PASS = "Secret!@#$1234"; // Password for secure MQTT
+
+// Topic format: ble/tlm/<mac-without-colons>
+const char* MQTT_TOPIC_PREFIX = "DMA/BLE/TLM/";
+
+// ===== Globals =====
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Buffer for incoming serial lines
+String incomingLine = "";
+#define MAX_BATCH_LINES 1024
+std::vector<String> batchLines; // temporarily store received CSV lines
+
+// LED blink
+unsigned long lastLedToggle = 0;
+bool ledState = false;
+uint32_t ledBlinkInterval = 300;
+
+// ===== Helpers =====
+String sanitizeMacForTopic(const String& mac) {
+  String s = mac;
+  s.replace(":", "");
+  s.toLowerCase();
+  return s;
+}
+
+// Publish one CSV line to MQTT
+bool publishCsvLine(const String& csvLine) {
+  // csvLine = mac,temp,volt,uptime,advcount,rssi
+  // extract mac first token
+  int p = csvLine.indexOf(',');
+  if (p <= 0) return false;
+  String mac = csvLine.substring(0, p);
+  String topic = String(MQTT_TOPIC_PREFIX) + sanitizeMacForTopic(mac);
+  // The payload could be the rest after mac
+  String payload = csvLine.substring(p + 1);
+  // Publish
+  bool ok = mqttClient.publish(topic.c_str(), payload.c_str());
+  return ok;
+}
+
+void blinkLedOnce() {
+  // brief blink to show activity
+  digitalWrite(LED_STATUS_PIN, HIGH);
+  delay(60);
+  digitalWrite(LED_STATUS_PIN, LOW);
+}
+
+// ===== MQTT & WiFi setup =====
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to WiFi '%s' ...\n", WIFI_SSID);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { // 15s
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("WiFi connect failed");
+  }
+}
+
+void connectMQTT() {
+  if (mqttClient.connected()) return;
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  Serial.printf("Connecting to MQTT %s:%u ...\n", MQTT_SERVER, MQTT_PORT);
+  unsigned long start = millis();
+  while (!mqttClient.connected() && millis() - start < 10000) {
+    Serial.print("MQTT connect...");
+    bool ok;
+    // Use secure connection with credentials
+    ok = mqttClient.connect("esp32_receiver", MQTT_USER, MQTT_PASS);
+    if (ok) {
+      Serial.println("connected");
+      break;
+    } else {
+      Serial.printf("failed rc=%d\n", mqttClient.state());
+      delay(500);
+    }
+  }
+}
+
+// ===== Setup & loop =====
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
+  pinMode(LED_STATUS_PIN, OUTPUT);
+  digitalWrite(LED_STATUS_PIN, LOW);
+
+  Serial.println("\n🚀 Receiver + MQTT Gateway (ESP32)");
+  connectWiFi();
+  connectMQTT();
+}
+
+void loop() {
+  // Ensure WiFi/MQTT
+  if (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(LED_STATUS_PIN, HIGH); // solid ON when WiFi down
+    connectWiFi();
+  }
+  if (!mqttClient.connected()) {
+    digitalWrite(LED_STATUS_PIN, HIGH); // solid ON when MQTT down
+    connectMQTT();
+  } else {
+    // blink to show healthy
+    if (millis() - lastLedToggle >= ledBlinkInterval) {
+      lastLedToggle = millis();
+      ledState = !ledState;
+      digitalWrite(LED_STATUS_PIN, ledState ? HIGH : LOW);
+    }
+  }
+
+  // Read Serial2 incoming bytes non-blocking
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      String line = incomingLine;
+      incomingLine = "";
+      line.trim();
+      if (line.length() == 0) continue;
+      if (line == "END") {
+        // process batch
+        Serial.printf("Received END, batch size=%d\n", (int)batchLines.size());
+        bool allOk = true;
+        // publish each
+        for (size_t i = 0; i < batchLines.size(); ++i) {
+          bool ok = publishCsvLine(batchLines[i]);
+          if (!ok) {
+            Serial.printf("Publish failed for line #%u: %s\n", (unsigned)i, batchLines[i].c_str());
+            allOk = false;
+            // try reconnect
+            if (!mqttClient.connected()) connectMQTT();
+          } else {
+            // blink to show publish activity
+            blinkLedOnce();
+            delay(10);
+          }
+        }
+        if (allOk) {
+          Serial2.print("ACK\n");
+          Serial.println("Sent ACK");
+        } else {
+          Serial2.print("NACK\n");
+          Serial.println("Sent NACK");
+        }
+        batchLines.clear();
+      } else {
+        // push csv line to batch
+        if (batchLines.size() < MAX_BATCH_LINES) batchLines.push_back(line);
+        else {
+          // overflow: drop and flag
+          Serial.println("Batch overflow -> dropping line");
+        }
+      }
+    } else {
+      incomingLine += c;
+      // guard line length
+      if (incomingLine.length() > 256) incomingLine = incomingLine.substring(0, 256);
+    }
+  }
+
+  mqttClient.loop();
+  delay(10);
+}

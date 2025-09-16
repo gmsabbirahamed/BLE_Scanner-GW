@@ -1,0 +1,95 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+#define ENDIAN_CHANGE_U16(x) ((((x)&0xFF00) >> 8) + (((x)&0xFF) << 8))
+#define SCAN_TIME_MS 5000  // 5 seconds scan time
+
+NimBLEScan* pBLEScan;
+
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+
+    if (!advertisedDevice->haveName()) return; // skip if no name
+
+    std::string devName = advertisedDevice->getName();
+    if (devName != "KBPro_605504") return;  // only this device
+
+
+    if (processiBeacon(advertisedDevice)) return;
+    if (processEddystoneTLM(advertisedDevice)) return;
+
+    // Extendable: Add your own processing rules here
+  }
+
+  bool processiBeacon(const NimBLEAdvertisedDevice* device) {
+    if (!device->haveManufacturerData()) return false;
+
+    std::string mData = device->getManufacturerData();
+    if (mData.length() != 25 || (uint8_t)mData[0] != 0x4C || (uint8_t)mData[1] != 0x00) return false;
+
+    NimBLEBeacon beacon;
+    beacon.setData(reinterpret_cast<const uint8_t*>(mData.data()), mData.length());
+
+    Serial.println("\nFound iBeacon");
+    Serial.printf("   ▸ Name  : %s \n", device->getName().c_str());
+    Serial.printf("   ▸ UUID  : %s\n", beacon.getProximityUUID().toString().c_str());
+    Serial.printf("   ▸ Major : %d\n", ENDIAN_CHANGE_U16(beacon.getMajor()));
+    Serial.printf("   ▸ Minor : %d\n", ENDIAN_CHANGE_U16(beacon.getMinor()));
+    Serial.printf("   ▸ Power : %d dBm\n", beacon.getSignalPower());
+    Serial.printf("   ▸ RSSI  : %d dBm\n", device->getRSSI());
+    
+    return true;
+}
+
+
+bool processEddystoneTLM(const NimBLEAdvertisedDevice* device) {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+    
+    if (!device->haveServiceUUID() || !device->getServiceUUID().equals(eddyUUID)) return false;
+    
+    std::string serviceData = device->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return false;
+    
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+    
+    Serial.println("\nFound Eddystone-TLM Beacon");
+    Serial.printf("   ▸ Name            : %s \n", device->getName().c_str());
+    Serial.printf("   ▸ Battery Voltage : %d mV\n", tlm.getVolt());
+    // Serial.printf("   ▸ Temp (parsed)   : %.2f °C\n", (double)tlm.getTemp());
+    
+    int rawTemp = (int)serviceData[5] + (int)(serviceData[4] << 8);
+    float calcTemp = rawTemp / 256.0f;
+    Serial.printf("   ▸ Temp (raw calc) : %.2f °C\n", calcTemp);
+
+    Serial.printf("   ▸ Adv Count       : %d\n", tlm.getCount());
+    Serial.printf("   ▸ Uptime          : %d days\n", tlm.getTime() / 86400);
+    Serial.printf("   ▸ RSSI            : %d dBm\n", device->getRSSI());
+    return true;
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n📡 BLE Beacon Scanner Initialized");
+
+  NimBLEDevice::init("ESP32-Scanner");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks);
+  pBLEScan->setActiveScan(true);  // Full scan data
+  pBLEScan->setInterval(100);     // Time between scans
+  pBLEScan->setWindow(99);        // Scan window <= interval
+}
+
+void loop() {
+    NimBLEScanResults results = pBLEScan->getResults(SCAN_TIME_MS, false);
+    Serial.print("Device found: ");
+    Serial.print(results.getCount());
+    Serial.println("Scan done!");
+    pBLEScan->clearResults();
+    delay(2000);
+}

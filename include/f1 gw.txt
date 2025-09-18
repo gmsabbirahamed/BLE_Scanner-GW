@@ -8,15 +8,15 @@
 #define WIFI_SSID "Settings"
 #define WIFI_PASS "procariota156"
 
-#define MQTT_SERVER "broker2.dma-bd.com"
+#define MQTT_SERVER "broker2.dma-bd.com"   // change if you use your own broker
 #define MQTT_PORT 1883
 #define MQTT_USER "broker2"
 #define MQTT_PASS "Secret!@#$1234"
 #define MQTT_TOPIC "DMA/BLE/PUB/TLM"
 
 #define SERIAL2_BAUD 115200
-#define SERIAL2_RX 21
-#define SERIAL2_TX 22
+#define SERIAL2_TX 14    // adjust as per wiring
+#define SERIAL2_RX 12
 // ==========================================
 
 WiFiClient espClient;
@@ -24,56 +24,55 @@ PubSubClient client(espClient);
 
 String incomingLine = "";
 
-// ---------------- MQTT Reconnect ----------------
+// Reconnect to MQTT broker
 void reconnectMQTT() {
   while (!client.connected()) {
     Serial.print("🔄 Connecting to MQTT...");
     if (client.connect(GW_ID, MQTT_USER, MQTT_PASS)) {
       Serial.println("✅ connected");
     } else {
-      Serial.print("❌ failed rc=");
-      Serial.println(client.state());
-      delay(3000);
+      Serial.print("❌ failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5s");
+      delay(5000);
     }
   }
 }
 
-// ---------------- Publish + ACK ----------------
+// Publish line to MQTT with GW_ID
 void publishLine(const String &line) {
   String payload = String(GW_ID) + "," + line;
-  bool ok = client.publish(MQTT_TOPIC, payload.c_str());
-  if (ok) {
-    Serial.print("📤 Sent: ");
-    Serial.println(payload);
-    Serial2.println("ACK");  // send ACK back
-  } else {
-    Serial.println("❌ MQTT publish failed");
-  }
+  client.publish(MQTT_TOPIC, payload.c_str());
+  Serial.print("📤 MQTT Sent: ");
+  Serial.println(payload);
 }
 
-// ---------------- Setup ----------------
 void setup() {
   Serial.begin(115200);
   Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
 
-  Serial.print("🌐 WiFi connecting");
+  // WiFi
+  Serial.print("🌐 Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\n✅ WiFi connected");
+  Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
+  // MQTT
   client.setServer(MQTT_SERVER, MQTT_PORT);
 }
 
-// ---------------- Loop ----------------
 void loop() {
-  if (!client.connected()) reconnectMQTT();
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
   client.loop();
 
-  // Read BLE data from scanner
+  // Read from Serial2 (scanner)
   while (Serial2.available()) {
     char c = Serial2.read();
     if (c == '\n') {

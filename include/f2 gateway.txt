@@ -1,0 +1,222 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ================= CONFIG =================
+#define GW_ID "1101002509170001"
+
+#define WIFI_SSID "Settings"
+#define WIFI_PASS "procariota156"
+
+#define MQTT_SERVER "broker2.dma-bd.com"
+#define MQTT_PORT 1883
+#define MQTT_USER "broker2"
+#define MQTT_PASS "Secret!@#$1234"
+#define MQTT_TOPIC "DMA/BLE/PUB/TLM"
+#define MQTT_HEARTBEAT "DMA/BLE/HEARTBEAT"
+
+#define SERIAL2_BAUD 115200
+#define SERIAL2_TX 14
+#define SERIAL2_RX 12
+
+#define QUEUE_SIZE 50
+#define MAX_LINE_LEN 256
+#define WIFI_TIMEOUT 30000UL   // 30s
+#define MQTT_TIMEOUT 60000UL   // 60s
+// ==========================================
+
+// Track dataset publish status for ACK/NACK
+bool datasetFailed = false;
+
+// Trackers
+unsigned long lastWiFiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
+unsigned long lastHeartbeat = 0;
+
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+QueueHandle_t msgQueue;
+
+// ============ WiFi ============
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("🌐 Connecting WiFi");
+  WiFi.disconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ WiFi failed, retry later");
+  }
+}
+
+// ============ MQTT ============
+void connectMQTT() {
+  if (client.connected()) return;
+
+  Serial.print("🔄 Connecting MQTT...");
+  if (client.connect(GW_ID, MQTT_USER, MQTT_PASS)) {
+    Serial.println("✅ MQTT connected");
+  } else {
+    Serial.print("❌ MQTT fail rc=");
+    Serial.println(client.state());
+  }
+}
+
+// void publishLine(const char *line) {
+//   if (!client.connected()) return;
+
+//   String payload = String(GW_ID) + "," + line;
+//   if (client.publish(MQTT_TOPIC, payload.c_str())) {
+//     Serial.print("📤 Sent: ");
+//     Serial.println(payload);
+//     Serial2.print("ACK");
+//   } else {
+//     Serial.println("⚠️ MQTT publish failed");
+//   }
+// }
+void publishLine(const char *line) {
+    if (!client.connected()) return;
+
+    String payload = String(GW_ID) + "," + line;
+    bool ok = client.publish(MQTT_TOPIC, payload.c_str());
+
+    if (!ok) {
+        Serial.print("⚠️ Publish failed: ");
+        Serial.println(payload);
+        // mark dataset as failed for taskSerialReader to send NACK later
+        // We use a global flag
+        // extern bool datasetFailed;
+        datasetFailed = true;
+    } else {
+        Serial.print("📤 Published: ");
+        Serial.println(payload);
+    }
+}
+
+
+
+// ============ Tasks ============
+void taskSerialReader(void *param) {
+    char lineBuf[MAX_LINE_LEN];
+    size_t idx = 0;
+    static bool datasetFailed = false; // track if any line failed
+
+    for (;;) {
+        while (Serial2.available()) {
+            char c = Serial2.read();
+
+            if (c == '\n') {
+                lineBuf[idx] = '\0';
+                String line = String(lineBuf);
+                line.trim();
+                idx = 0; // reset buffer
+
+                if (line.length() == 0) continue;
+
+                if (line == "END") {
+                    // Dataset finished → send ACK/NACK based on result
+                    if (datasetFailed) {
+                        Serial2.println("NACK");
+                        Serial2.flush();
+                        Serial.println("⚠️ Dataset publish failed → NACK sent");
+                    } else {
+                        Serial2.println("ACK");
+                        Serial2.flush();
+                        Serial.println("✅ Dataset publish OK → ACK sent");
+                    }
+                    datasetFailed = false; // reset for next dataset
+                } else {
+                    // Queue the line for MQTT publish
+                    if (uxQueueSpacesAvailable(msgQueue) > 0) {
+                        char *msg = (char *)malloc(line.length() + 1);
+                        if (msg) {
+                            strcpy(msg, line.c_str());
+                            xQueueSend(msgQueue, &msg, 0);
+                        }
+                    } else {
+                        Serial.println("⚠️ Queue full, dropping line");
+                        datasetFailed = true; // mark dataset as failed
+                    }
+                }
+            } else {
+                if (idx < MAX_LINE_LEN - 1) {
+                    lineBuf[idx++] = c;
+                } else {
+                    idx = 0; // overflow, reset
+                    Serial.println("⚠️ Line too long, dropped");
+                    datasetFailed = true; // mark dataset as failed
+                }
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+
+void taskMQTTPublisher(void *param) {
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      connectWiFi();
+    }
+    if (!client.connected()) {
+      connectMQTT();
+    }
+    client.loop();
+
+    // Heartbeat every 60s
+    if (millis() - lastHeartbeat > 60000) {
+      String hb = String(GW_ID) + ",ALIVE";
+      client.publish(MQTT_HEARTBEAT, hb.c_str());
+      Serial.println("💓 Heartbeat sent");
+      lastHeartbeat = millis();
+    }
+
+    // Process queued messages
+    char *msg = nullptr;
+    if (xQueueReceive(msgQueue, &msg, 0) == pdTRUE) {
+      publishLine(msg);
+      free(msg);
+    }
+
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+// ============ Setup ============
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+
+  WiFi.mode(WIFI_STA);
+  connectWiFi();
+
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+
+  msgQueue = xQueueCreate(QUEUE_SIZE, sizeof(char *));
+  if (!msgQueue) {
+    Serial.println("❌ Queue create failed");
+    for (;;);
+  }
+
+  // Create tasks
+  xTaskCreatePinnedToCore(taskSerialReader, "SerialReader", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(taskMQTTPublisher, "MQTTPublisher", 4096, NULL, 1, NULL, 1);
+
+  Serial.println("🚀 Gateway started");
+}
+
+void loop() {
+  // loop is unused (all handled by tasks)
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+}

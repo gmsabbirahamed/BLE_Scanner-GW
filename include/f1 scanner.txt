@@ -1,0 +1,122 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+// ============ CONFIG ============
+#define MAX_SENSORS 20
+#define SEND_INTERVAL 60000UL // 5 minutes in ms
+#define SERIAL2_BAUD 115200
+#define SERIAL2_TX 17   // adjust to your wiring
+#define SERIAL2_RX 16   // adjust to your wiring
+// ================================
+
+NimBLEScan* pBLEScan;
+
+struct SensorData {
+  String mac;
+  float temp;
+  int batt;
+  uint32_t advCnt;
+  int rssi;
+  unsigned long lastSeen;
+};
+
+SensorData sensors[MAX_SENSORS];
+
+int sensorCount = 0;
+
+unsigned long lastSend = 0;
+
+// Find or create sensor slot
+int findSensor(const String &mac) {
+  for (int i = 0; i < sensorCount; i++) {
+    if (sensors[i].mac == mac) return i;
+  }
+  if (sensorCount < MAX_SENSORS) {
+    sensors[sensorCount].mac = mac;
+    return sensorCount++;
+  }
+  return -1; // table full
+}
+
+// BLE scan callback
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+
+    if (!advertisedDevice->haveServiceUUID() ||
+        !advertisedDevice->getServiceUUID().equals(eddyUUID)) {
+      return; // not Eddystone
+    }
+
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // only TLM
+
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    String mac = advertisedDevice->getAddress().toString().c_str();
+    int idx = findSensor(mac);
+    if (idx >= 0) {
+      // Temp decode (manual for safety)
+      int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+      float calcTemp = rawTemp / 256.0f;
+
+      sensors[idx].temp = calcTemp;
+      sensors[idx].batt = tlm.getVolt();
+      sensors[idx].advCnt = tlm.getCount();
+      sensors[idx].rssi = advertisedDevice->getRSSI();
+      sensors[idx].lastSeen = millis();
+    }
+  }
+};
+
+// Send collected dataset to Serial2
+void sendData() {
+  Serial.println("\n📤 Sending dataset to Serial2...");
+  for (int i = 0; i < sensorCount; i++) {
+    Serial2.print(sensors[i].mac); Serial2.print(",");
+    Serial2.print(sensors[i].temp, 2); Serial2.print(",");
+    Serial2.print(sensors[i].batt); Serial2.print(",");
+    Serial2.print(sensors[i].advCnt); Serial2.print(",");
+    Serial2.print(sensors[i].rssi);
+    Serial2.println();
+    
+    Serial.print(sensors[i].mac); Serial.print(",");
+    Serial.print(sensors[i].temp, 2); Serial.print(",");
+    Serial.print(sensors[i].batt); Serial.print(",");
+    Serial.print(sensors[i].advCnt); Serial.print(",");
+    Serial.print(sensors[i].rssi);
+    Serial.println();
+  }
+  Serial2.println("END"); // mark dataset end
+  Serial.println("✅ Dataset sent");
+}
+
+ScanCallbacks scanCallbacks;
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+
+  Serial.println("\n🚀 BLE Data Collector Started");
+
+  NimBLEDevice::init("ESP32-Collector");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true); // true = report duplicates
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  pBLEScan->start(0, false, false); // continuous
+
+  lastSend = millis();
+}
+
+void loop() {
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    sendData();
+  }
+  delay(100); // keep loop light
+}

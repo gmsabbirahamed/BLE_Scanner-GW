@@ -1,0 +1,307 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+#include <FastLED.h>
+
+// ============ CONFIG ============
+#define MAX_SENSORS 42
+#define SEND_INTERVAL 60000UL // 60s
+#define SERIAL2_BAUD 115200
+#define SERIAL2_TX 17   // adjust to your wiring
+#define SERIAL2_RX 16   // adjust to your wiring
+
+// NeoPixel (FastLED) config
+#define LED_PIN 4
+#define NUM_LEDS 1
+#define BRIGHTNESS 80
+
+// Blink durations and ACK timeout
+#define BLINK_MS 100
+#define ACK_TIMEOUT_MS 3000
+#define MIN_BLE_BLINK_INTERVAL 800 // debounce between BLE update blinks
+// ================================
+
+NimBLEScan* pBLEScan;
+
+// simple sensor struct
+struct SensorData {
+  String mac;
+  float temp;
+  int batt;
+  uint32_t advCnt;
+  int rssi;
+  unsigned long lastSeen;
+};
+
+static SensorData sensors[MAX_SENSORS];
+static int sensorCount = 0;
+
+// protect sensors[] and sensorCount (NimBLE callback runs on a different task)
+portMUX_TYPE sensorMux = portMUX_INITIALIZER_UNLOCKED;
+
+// timing
+unsigned long lastSend = 0;
+
+// Serial2 ACK tracking
+volatile bool waitingForAck = false;
+unsigned long ackDeadline = 0;
+bool lastAckResult = false; // true=ACK, false=failed
+
+// FastLED
+CRGB leds[NUM_LEDS];
+
+// Blink request state (posted from any context, executed in loop())
+enum BlinkColor { BLINK_OFF=0, BLINK_WHITE, BLINK_GREEN, BLINK_PINK };
+volatile BlinkColor blinkRequest = BLINK_OFF;
+volatile unsigned long blinkRequestDuration = 0; // ms
+volatile unsigned long blinkRequestTime = 0; // when request was posted
+
+// Debounce last BLE update blink
+unsigned long lastBleBlinkMillis = 0;
+
+// Find or create sensor slot (thread-safe)
+int findSensor(const String &mac) {
+  int idx = -1;
+  portENTER_CRITICAL(&sensorMux);
+  for (int i = 0; i < sensorCount; i++) {
+    if (sensors[i].mac == mac) { idx = i; break; }
+  }
+  if (idx == -1 && sensorCount < MAX_SENSORS) {
+    idx = sensorCount++;
+    sensors[idx].mac = mac;
+  }
+  portEXIT_CRITICAL(&sensorMux);
+  return idx;
+}
+
+// Post a blink request (safe to call from callbacks)
+void postBlink(BlinkColor color, unsigned long durationMs=BLINK_MS) {
+  // Only change request atomically
+  blinkRequest = color;
+  blinkRequestDuration = durationMs;
+  blinkRequestTime = millis();
+}
+
+// Non-blocking blink executor (must be called frequently from loop())
+void handleBlink() {
+  static bool blinking = false;
+  static unsigned long blinkStart = 0;
+  static BlinkColor activeColor = BLINK_OFF;
+
+  // If a new request posted and not currently blinking, start it
+  if (!blinking && blinkRequest != BLINK_OFF) {
+    activeColor = blinkRequest;
+    blinkStart = millis();
+
+    switch (activeColor) {
+      case BLINK_WHITE: leds[0] = CRGB::White; break;
+      case BLINK_GREEN: leds[0] = CRGB::Green; break;
+      case BLINK_PINK:  leds[0] = CRGB(255, 20, 147); break; // pink-ish
+      default: leds[0] = CRGB::Black; break;
+    }
+    FastLED.show();
+    blinking = true;
+
+    // clear request so other threads can post again
+    blinkRequest = BLINK_OFF;
+  }
+
+  // if blinking, check duration and turn off when done
+  if (blinking) {
+    if (millis() - blinkStart >= blinkRequestDuration) {
+      leds[0] = CRGB::Black;
+      FastLED.show();
+      blinking = false;
+      activeColor = BLINK_OFF;
+    }
+  }
+}
+
+// BLE scan callback
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+
+    if (!advertisedDevice->haveServiceUUID() ||
+        !advertisedDevice->getServiceUUID().equals(eddyUUID)) {
+      return; // not Eddystone
+    }
+
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // only TLM frames
+
+    // parse TLM safely (serviceData length check)
+    if (serviceData.length() < 6) return;
+
+    // manual decode temp: bytes 4..5 (as your original)
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+
+    // use NimBLEEddystoneTLM helper to extract volt and adv count if possible
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    String mac = advertisedDevice->getAddress().toString().c_str();
+
+    // find/create sensor slot
+    int idx = findSensor(mac);
+    if (idx >= 0) {
+      // write into array inside critical section
+      portENTER_CRITICAL(&sensorMux);
+      sensors[idx].temp = calcTemp;
+      sensors[idx].batt = tlm.getVolt();
+      sensors[idx].advCnt = tlm.getCount();
+      sensors[idx].rssi = advertisedDevice->getRSSI();
+      sensors[idx].lastSeen = millis();
+      portEXIT_CRITICAL(&sensorMux);
+
+      // Blink once for update/add (debounced)
+      unsigned long now = millis();
+      if ((now - lastBleBlinkMillis) >= MIN_BLE_BLINK_INTERVAL) {
+        lastBleBlinkMillis = now;
+        postBlink(BLINK_WHITE, BLINK_MS);
+      }
+    }
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+// Send collected dataset to Serial2 (non-blocking in the sense we only write; ACK handled elsewhere)
+void sendData() {
+  Serial.println("\n📤 Sending dataset to Serial2...");
+  // snapshot sensors under lock to minimize time in critical
+  SensorData snapshot[MAX_SENSORS];
+  int count = 0;
+  portENTER_CRITICAL(&sensorMux);
+  count = sensorCount;
+  for (int i = 0; i < count; i++) snapshot[i] = sensors[i];
+  portEXIT_CRITICAL(&sensorMux);
+
+  for (int i = 0; i < count; i++) {
+    Serial2.print(snapshot[i].mac); Serial2.print(",");
+    Serial2.print(snapshot[i].temp, 2); Serial2.print(",");
+    Serial2.print(snapshot[i].batt); Serial2.print(",");
+    Serial2.print(snapshot[i].advCnt); Serial2.print(",");
+    Serial2.print(snapshot[i].rssi);
+    Serial2.println();
+
+    Serial.print(snapshot[i].mac); Serial.print(",");
+    Serial.print(snapshot[i].temp, 2); Serial.print(",");
+    Serial.print(snapshot[i].batt); Serial.print(",");
+    Serial.print(snapshot[i].advCnt); Serial.print(",");
+    Serial.print(snapshot[i].rssi);
+    Serial.println();
+  }
+  Serial2.println("END"); // mark dataset end
+  Serial.println("✅ Dataset sent — awaiting ACK...");
+
+  // start ACK wait (non-blocking)
+  waitingForAck = true;
+  ackDeadline = millis() + ACK_TIMEOUT_MS;
+  lastAckResult = false;
+}
+
+// handle Serial2 incoming lines for ACK/NACK
+void processSerial2Lines() {
+  static String rxLine = "";
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      String line = rxLine;
+      rxLine = "";
+      line.trim();
+      if (line.length() == 0) continue;
+      // check for ACK or NACK
+      if (waitingForAck) {
+        if (line.equalsIgnoreCase("ACK")) {
+          waitingForAck = false;
+          lastAckResult = true;
+          Serial.println("🔔 ACK received");
+          postBlink(BLINK_GREEN, BLINK_MS);
+        } else if (line.equalsIgnoreCase("NACK")) {
+          waitingForAck = false;
+          lastAckResult = false;
+          Serial.println("⚠️ NACK received");
+          postBlink(BLINK_PINK, BLINK_MS);
+        } else {
+          // maybe other messages; if they contain "ACK" treat as ack.
+          if (line.indexOf("ACK") >= 0) {
+            waitingForAck = false;
+            lastAckResult = true;
+            Serial.println("🔔 ACK (in-line) received");
+            postBlink(BLINK_GREEN, BLINK_MS);
+          } else if (line.indexOf("NACK") >= 0) {
+            waitingForAck = false;
+            lastAckResult = false;
+            Serial.println("⚠️ NACK (in-line) received");
+            postBlink(BLINK_PINK, BLINK_MS);
+          } else {
+            // just log other messages
+            Serial.print("Serial2: ");
+            Serial.println(line);
+          }
+        }
+      } else {
+        // Not currently waiting for ACK — just log incoming lines
+        Serial.print("Serial2: ");
+        Serial.println(line);
+      }
+    } else {
+      rxLine += c;
+      // guard length
+      if (rxLine.length() > 200) rxLine = rxLine.substring(rxLine.length() - 200);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+
+  Serial.println("\n🚀 BLE Data Collector with non-blocking LED & ACK");
+
+  // FastLED init
+  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  leds[0] = CRGB::Black;
+  FastLED.show();
+
+  // NimBLE init
+  NimBLEDevice::init("ESP32-Collector");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true); // report duplicates
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  pBLEScan->start(0, false, false); // continuous scan
+
+  lastSend = millis();
+}
+
+void loop() {
+  // 1) Periodic send
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    sendData();
+  }
+
+  // 2) Process incoming Serial2 lines (ACK handling) - non-blocking
+  processSerial2Lines();
+
+  // 3) Check for ACK timeout
+  if (waitingForAck && millis() > ackDeadline) {
+    waitingForAck = false;
+    lastAckResult = false;
+    Serial.println("⏱️ ACK timeout");
+    postBlink(BLINK_PINK, BLINK_MS);
+  }
+
+  // 4) Handle LED blink state machine (non-blocking)
+  handleBlink();
+
+  // keep loop light and responsive
+  delay(20);
+}

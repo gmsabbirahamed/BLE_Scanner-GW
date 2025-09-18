@@ -1,0 +1,150 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+#include <FastLED.h>
+
+// ============ CONFIG ============
+#define MAX_SENSORS 100
+#define SEND_INTERVAL 300000UL // 5 minutes
+#define SERIAL2_BAUD 115200
+#define SERIAL2_TX 17
+#define SERIAL2_RX 16
+
+#define LED_PIN 4
+#define NUM_LEDS 1
+// ================================
+
+CRGB leds[NUM_LEDS];
+NimBLEScan* pBLEScan;
+
+struct SensorData {
+  String mac;
+  float temp;
+  int batt;
+  uint32_t advCnt;
+  int rssi;
+  unsigned long lastSeen;
+};
+
+SensorData sensors[MAX_SENSORS];
+int sensorCount = 0;
+unsigned long lastSend = 0;
+
+// ---------------- LED Helpers ----------------
+void blinkLED(CRGB color, int onMs = 200, int offMs = 100) {
+  leds[0] = color;
+  FastLED.show();
+  delay(onMs);
+  leds[0] = CRGB::Black;
+  FastLED.show();
+  delay(offMs);
+}
+
+// ---------------- Find or create sensor slot ----------------
+int findSensor(const String &mac) {
+  for (int i = 0; i < sensorCount; i++) {
+    if (sensors[i].mac == mac) return i;
+  }
+  if (sensorCount < MAX_SENSORS) {
+    sensors[sensorCount].mac = mac;
+    return sensorCount++;
+  }
+  return -1; // full
+}
+
+// ---------------- BLE scan callback ----------------
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+    if (!dev->haveServiceUUID() || !dev->getServiceUUID().equals(eddyUUID)) return;
+
+    std::string data = dev->getServiceData(eddyUUID);
+    if (data.empty() || (uint8_t)data[0] != 0x20) return; // TLM only
+
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(data.data()), data.length());
+
+    String mac = dev->getAddress().toString().c_str();
+    int idx = findSensor(mac);
+    if (idx >= 0) {
+      int rawTemp = ((uint8_t)data[4] << 8) | (uint8_t)data[5];
+      float calcTemp = rawTemp / 256.0f;
+      sensors[idx].temp = calcTemp;
+      sensors[idx].batt = tlm.getVolt();
+      sensors[idx].advCnt = tlm.getCount();
+      sensors[idx].rssi = dev->getRSSI();
+      sensors[idx].lastSeen = millis();
+    }
+  }
+};
+
+ScanCallbacks scanCallbacks;
+
+// ---------------- Send dataset + wait for ACK ----------------
+bool sendData() {
+  Serial.println("\n📤 Sending dataset...");
+  blinkLED(CRGB::Yellow); // blink once when sending
+
+  for (int i = 0; i < sensorCount; i++) {
+    Serial2.printf("%s,%.2f,%d,%lu,%d\n",
+                   sensors[i].mac.c_str(),
+                   sensors[i].temp,
+                   sensors[i].batt,
+                   sensors[i].advCnt,
+                   sensors[i].rssi);
+  }
+  Serial2.println("END");
+
+  // --- wait for ACK ---
+  unsigned long start = millis();
+  String ack = "";
+  while (millis() - start < 5000) { // wait max 5s
+    if (Serial2.available()) {
+      ack = Serial2.readStringUntil('\n');
+      ack.trim();
+      if (ack == "ACK") {
+        Serial.println("✅ ACK received");
+        blinkLED(CRGB::Green); // blink once on ACK
+        return true;
+      }
+    }
+  }
+  Serial.println("❌ No ACK (timeout)");
+  blinkLED(CRGB::Red); // blink once on fail
+  return false;
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
+  leds[0] = CRGB::Black; FastLED.show();
+
+  Serial.begin(115200);
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+
+  Serial.println("\n🚀 BLE Collector Started");
+
+  NimBLEDevice::init("ESP32-Collector");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&scanCallbacks, true);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  pBLEScan->start(0, false, false);
+
+  lastSend = millis();
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+    if (!sendData()) {
+      Serial.println("🔁 Retrying...");
+      delay(2000);
+      sendData(); // retry once
+    }
+  }
+  delay(100);
+}

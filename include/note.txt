@@ -1,0 +1,13 @@
+Your firmware will run long-term fine with 20 tags.
+
+To scale to 100 tags:
+
+Increase MAX_SENSORS.
+
+Replace String with char[] to avoid memory fragmentation.
+
+(Optional) Move sending to a FreeRTOS task for clean separation.
+
+ESP32 + NimBLE can handle ~100 advertising devices, but keep setScanCallbacks(..., true) (duplicates reported) since you need the latest values.
+
+👉 Do you want me to rewrite your firmware with the char[] fix + FreeRTOS sender task so it’s ready for 100 tags, or just keep it simple with MAX_SENSORS = 100 and String?

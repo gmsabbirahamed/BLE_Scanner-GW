@@ -1,0 +1,283 @@
+// main.cpp
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include "NimBLEBeacon.h"
+#include "NimBLEEddystoneTLM.h"
+
+// ================= CONFIG =================
+#define MAX_SENSORS      120                // adjust as needed
+#define SEND_INTERVAL    30000UL           // send every 5 minutes (ms)
+#define SENSOR_TIMEOUT   600000UL           // remove sensors not seen for 10 minutes (ms)
+#define SCAN_DURATION_MS 5000               // each blocking scan duration in ms
+
+#define SERIAL2_BAUD 115200
+#define SERIAL2_TX   17   // scanner -> gateway TX pin (adjust)
+#define SERIAL2_RX   16   // scanner -> gateway RX pin (adjust)
+// ==========================================
+
+// Sensor storage structure (fixed buffers)
+struct SensorData {
+  char mac[18];     // "AA:BB:CC:DD:EE:FF" + null
+  float temp;
+  int batt;
+  uint32_t advCnt;
+  int rssi;
+  uint32_t lastSeen; // millis()
+  bool valid;
+};
+
+static SensorData sensors[MAX_SENSORS];
+static int sensorCount = 0;
+
+// Synchronization
+static SemaphoreHandle_t sensorsMutex = NULL;
+
+// NimBLE scan pointer
+static NimBLEScan* pBLEScan = nullptr;
+
+// Helper: get current millis safely (wrap-safe usage)
+static inline uint32_t nowMillis() {
+  return (uint32_t)millis();
+}
+
+// Safe mac copy
+static void setMacStr(char* dest, const std::string &src) {
+  // src like "AA:BB:CC:DD:EE:FF"
+  strncpy(dest, src.c_str(), 17);
+  dest[17] = '\0';
+}
+
+// Find sensor by MAC or create new slot. Returns index or -1 if full.
+static int findOrCreateSensor(const char* mac) {
+  int freeIndex = -1;
+
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    if (sensors[i].valid) {
+      if (strncmp(sensors[i].mac, mac, 17) == 0) {
+        return i;
+      }
+    } else if (freeIndex == -1) {
+      freeIndex = i;
+    }
+  }
+
+  if (freeIndex != -1) {
+    // initialize slot
+    strncpy(sensors[freeIndex].mac, mac, 18);
+    sensors[freeIndex].temp = 0.0f;
+    sensors[freeIndex].batt = 0;
+    sensors[freeIndex].advCnt = 0;
+    sensors[freeIndex].rssi = 0;
+    sensors[freeIndex].lastSeen = nowMillis();
+    sensors[freeIndex].valid = true;
+
+    // update count (approximate)
+    sensorCount++;
+    return freeIndex;
+  }
+
+  // table full
+  return -1;
+}
+
+// BLE scan callback
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    // Only accept Eddystone (0xFEAA) and TLM (frame type 0x20)
+    NimBLEUUID eddyUUID = (uint16_t)0xFEAA;
+    if (!advertisedDevice->haveServiceUUID() || !advertisedDevice->getServiceUUID().equals(eddyUUID)) {
+      return;
+    }
+
+    std::string serviceData = advertisedDevice->getServiceData(eddyUUID);
+    if (serviceData.empty() || (uint8_t)serviceData[0] != 0x20) return; // only TLM
+
+    // Parse TLM payload with helper
+    NimBLEEddystoneTLM tlm;
+    tlm.setData(reinterpret_cast<const uint8_t*>(serviceData.data()), serviceData.length());
+
+    // Extract MAC
+    std::string macStr = advertisedDevice->getAddress().toString();
+    char macBuf[18];
+    strncpy(macBuf, macStr.c_str(), 17);
+    macBuf[17] = '\0';
+
+    // Compute temperature safe (manual fallback)
+    int rawTemp = ((uint8_t)serviceData[4] << 8) | (uint8_t)serviceData[5];
+    float calcTemp = rawTemp / 256.0f;
+
+    // Acquire mutex, update sensor entry
+    if (xSemaphoreTake(sensorsMutex, (TickType_t)10) == pdTRUE) {
+      int idx = findOrCreateSensor(macBuf);
+      if (idx >= 0) {
+        sensors[idx].temp = calcTemp;
+        sensors[idx].batt = tlm.getVolt();
+        sensors[idx].advCnt = tlm.getCount();
+        sensors[idx].rssi = advertisedDevice->getRSSI();
+        sensors[idx].lastSeen = nowMillis();
+        sensors[idx].valid = true;
+      }
+      xSemaphoreGive(sensorsMutex);
+    } else {
+      // Failed to get lock quickly; skip this update to avoid blocking
+    }
+  }
+};
+
+// Send collected dataset to Serial2 (protected by mutex)
+static void sendDataToSerial2() {
+  if (xSemaphoreTake(sensorsMutex, (TickType_t)1000) == pdTRUE) {
+    // Print header for debug
+    Serial.println("\n📤 Sending dataset to Serial2...");
+    for (int i = 0; i < MAX_SENSORS; i++) {
+      if (!sensors[i].valid) continue;
+      // Compose CSV line: MAC,temp,batt,advCnt,rssi
+      // Send to Serial2
+      Serial2.print(sensors[i].mac); Serial2.print(",");
+      Serial2.print(sensors[i].temp, 2); Serial2.print(",");
+      Serial2.print(sensors[i].batt); Serial2.print(",");
+      Serial2.print(sensors[i].advCnt); Serial2.print(",");
+      Serial2.print(sensors[i].rssi);
+      Serial2.println();
+
+      // Also local Serial for debug
+      Serial.print(sensors[i].mac); Serial.print(",");
+      Serial.print(sensors[i].temp, 2); Serial.print(",");
+      Serial.print(sensors[i].batt); Serial.print(",");
+      Serial.print(sensors[i].advCnt); Serial.print(",");
+      Serial.print(sensors[i].rssi);
+      Serial.println();
+    }
+    Serial2.println("END");
+    Serial.println("✅ Dataset sent");
+    xSemaphoreGive(sensorsMutex);
+  } else {
+    Serial.println("⚠️ sendData: failed to take sensors mutex");
+  }
+}
+
+// Cleanup sensors not seen for SENSOR_TIMEOUT
+static void cleanupStaleSensors() {
+  uint32_t now = nowMillis();
+  if (xSemaphoreTake(sensorsMutex, (TickType_t)1000) == pdTRUE) {
+    for (int i = 0; i < MAX_SENSORS; i++) {
+      if (!sensors[i].valid) continue;
+      if ((uint32_t)(now - sensors[i].lastSeen) > SENSOR_TIMEOUT) {
+        sensors[i].valid = false;
+        // keep sensorCount as approximate; not strictly decremented to avoid O(n) ops
+      }
+    }
+    xSemaphoreGive(sensorsMutex);
+  } else {
+    Serial.println("⚠️ cleanup: failed to take sensors mutex");
+  }
+}
+
+// ----- FreeRTOS Tasks -----
+// BLE task pinned to core 0 - runs blocking NimBLE scans repeatedly
+static void bleTask(void* pvParameters) {
+  ScanCallbacks* cb = (ScanCallbacks*)pvParameters;
+  NimBLEScan* scan = pBLEScan;
+  if (!scan) {
+    Serial.println("❌ bleTask: scan pointer null");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Ensure scan callbacks set (redundant safe)
+  scan->setScanCallbacks(cb, true);
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  Serial.println("🔵 BLE task started on CORE 0");
+  for (;;) {
+    // Blocking scan for SCAN_DURATION_MS - this keeps scanning work on this core
+    scan->start(SCAN_DURATION_MS / 1000, false); // start(seconds)
+    // NimBLE's start(seconds) takes seconds; if you want ms-level, you can use start(ms/1000)
+    // After start returns, loop will quickly restart it.
+    // small delay to yield
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// Sender & housekeeping task pinned to core 1
+static void senderTask(void* pvParameters) {
+  (void)pvParameters;
+  Serial.println("🟢 Sender task started on CORE 1");
+
+  uint32_t lastSend = nowMillis();
+
+  for (;;) {
+    uint32_t now = nowMillis();
+
+    // If it's time to send dataset
+    if ((uint32_t)(now - lastSend) >= SEND_INTERVAL) {
+      lastSend = now;
+      sendDataToSerial2();
+    }
+
+    // Periodic cleanup every loop (light)
+    cleanupStaleSensors();
+
+    // Sleep short to avoid busy spin
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ========== Setup & Loop ==========
+void setup() {
+  // Initialize serials
+  Serial.begin(115200);
+  while (!Serial) {
+    delay(10);
+  }
+  Serial2.begin(SERIAL2_BAUD, SERIAL_8N1, SERIAL2_RX, SERIAL2_TX);
+
+  Serial.println("\n🚀 Robust BLE Collector Starting");
+
+  // Initialize sensors array
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    sensors[i].valid = false;
+    sensors[i].lastSeen = 0;
+    sensors[i].mac[0] = '\0';
+  }
+
+  // Create mutex
+  sensorsMutex = xSemaphoreCreateMutex();
+  if (sensorsMutex == NULL) {
+    Serial.println("❌ Failed to create sensors mutex");
+    while (1) { delay(1000); }
+  }
+
+  // Initialize NimBLE
+  NimBLEDevice::init("ESP32-Collector");
+  pBLEScan = NimBLEDevice::getScan();
+  static ScanCallbacks scanCallbacks;
+  pBLEScan->setScanCallbacks(&scanCallbacks, true);
+  pBLEScan->setActiveScan(true);
+
+  // Create tasks
+  // BLE task pinned to core 0
+  BaseType_t ok1 = xTaskCreatePinnedToCore(
+    bleTask, "BLETask", 8192, &scanCallbacks, 2, NULL, 0);
+  if (ok1 != pdPASS) {
+    Serial.println("❌ Failed to create BLETask");
+    while (1) { delay(1000); }
+  }
+
+  // Sender task pinned to core 1
+  BaseType_t ok2 = xTaskCreatePinnedToCore(
+    senderTask, "SenderTask", 4096, NULL, 1, NULL, 1);
+  if (ok2 != pdPASS) {
+    Serial.println("❌ Failed to create SenderTask");
+    while (1) { delay(1000); }
+  }
+
+  Serial.println("✅ Setup complete. Tasks started.");
+}
+
+void loop() {
+  // Empty: tasks do the work.
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
